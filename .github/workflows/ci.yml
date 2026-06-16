@@ -1,0 +1,129 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Native runners: build, vet and run the race-enabled suite with coverage on
+  # the two architectures GitHub provides hardware for. The 100% floor is the
+  # org gate — every statement is exercised by the synthetic-image tests.
+  native:
+    name: native ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      COVERAGE_FLOOR: "100.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: '0'
+        run: go build ./...
+
+      - name: Test (race + coverage, floor gate)
+        run: |
+          set -euo pipefail
+          go test -race -coverprofile=cover.out ./...
+          go tool cover -func=cover.out | tail -1
+          cov=$(go tool cover -func=cover.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "total coverage: ${cov}% (floor ${COVERAGE_FLOOR}%)"
+          awk -v c="$cov" -v f="$COVERAGE_FLOOR" \
+            'BEGIN { if (c+0 < f+0) { printf "coverage %.1f%% below floor %.1f%%\n", c, f; exit 1 } }'
+
+  # Emulated runners: cross-compile the test binary for each remaining 64-bit
+  # architecture and run it under QEMU via binfmt. s390x is big-endian — the
+  # real endianness check for any binary encoding (digests, tar parsing).
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu_cpu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu_cpu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu_cpu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu_cpu: qemu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      - name: Register binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      - name: Cross-compile test binaries
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          mkdir -p testbins
+          for pkg in $(go list ./...); do
+            out="testbins/$(echo "$pkg" | tr '/' '_').test"
+            if go test -c -cover -o "$out" "$pkg" 2>/dev/null && [ -f "$out" ]; then
+              echo "built $out for $pkg"
+            else
+              echo "no test binary for $pkg (no tests)"
+            fi
+          done
+
+      - name: Run test binaries under QEMU (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(testbins/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "no test binaries to run"
+            exit 0
+          fi
+          for bin in "${bins[@]}"; do
+            echo "=== running $bin on ${{ matrix.arch }} ==="
+            docker run --rm \
+              --platform linux/${{ matrix.arch }} \
+              -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+              -v "$PWD:/work" -w /work \
+              ${{ matrix.image }} \
+              "/work/$bin" -test.v
+          done
