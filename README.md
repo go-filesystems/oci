@@ -1,8 +1,10 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems.png" alt="go-filesystems/oci" width="720"></p>
+
 # oci
 
-[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.26.4%2B-00ADD8)](https://go.dev/dl/)
-[![CGO_ENABLED=0](https://img.shields.io/badge/CGO__ENABLED-0-success)](https://pkg.go.dev/cmd/cgo)
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-filesystems/oci.svg)](https://pkg.go.dev/github.com/go-filesystems/oci)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-filesystems/oci/actions/workflows/ci.yml/badge.svg)](https://github.com/go-filesystems/oci/actions/workflows/ci.yml)
 
 Pure-Go, read-only **OCI / Docker image filesystem** for the
 [go-filesystems](https://github.com/go-filesystems) family. It overlays an
