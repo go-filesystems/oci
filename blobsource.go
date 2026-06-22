@@ -3,6 +3,7 @@ package oci
 import (
 	"archive/tar"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -51,22 +52,30 @@ func parseDigest(digest string) (alg, hexpart string, err error) {
 	return alg, hexpart, nil
 }
 
-// verifyDigest reads all of r and returns its bytes only if the sha256 (or
-// sha512 left as TODO) digest matches. Only sha256 verification is performed;
-// other algorithms are accepted without verification (matching common tooling
-// which only ships sha256).
+// verifyDigest verifies that data matches the given content digest. Both
+// sha256 and sha512 — the only algorithms registered in the OCI image-spec
+// digest set — are computed and compared. An unknown algorithm is REJECTED
+// (fail closed) rather than trusted unverified: an attacker must not be able to
+// bypass content verification by labelling a blob with a digest algorithm we
+// do not implement.
 func verifyDigest(digest string, data []byte) error {
 	alg, want, err := parseDigest(digest)
 	if err != nil {
 		return err
 	}
-	if alg != "sha256" {
-		return nil
+	var got string
+	switch alg {
+	case "sha256":
+		sum := sha256.Sum256(data)
+		got = hex.EncodeToString(sum[:])
+	case "sha512":
+		sum := sha512.Sum512(data)
+		got = hex.EncodeToString(sum[:])
+	default:
+		return fmt.Errorf("oci: unsupported digest algorithm %q (only sha256, sha512)", alg)
 	}
-	sum := sha256.Sum256(data)
-	got := hex.EncodeToString(sum[:])
 	if got != want {
-		return fmt.Errorf("oci: digest mismatch for %s: computed sha256:%s", digest, got)
+		return fmt.Errorf("oci: digest mismatch for %s: computed %s:%s", digest, alg, got)
 	}
 	return nil
 }
@@ -160,6 +169,7 @@ func tarballFromReader(r io.Reader) (BlobSource, error) {
 	mem := &memFS{files: map[string][]byte{}}
 	tr := tar.NewReader(r)
 	blobs := map[string]string{}
+	var total int64 // cumulative bytes buffered across all members
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -171,10 +181,22 @@ func tarballFromReader(r io.Reader) (BlobSource, error) {
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			continue
 		}
-		data, err := io.ReadAll(tr)
-		if err != nil {
-			return nil, fmt.Errorf("oci: reading archive member %q: %w", hdr.Name, err)
+		// Per-member and cumulative caps: an archive must not be able to
+		// buffer a decompression/expansion bomb. The smaller of the absolute
+		// per-member ceiling and the remaining total budget bounds this read;
+		// hdr.Size is attacker-controlled so it only ever shrinks the cap.
+		memberCap := maxArchiveMember
+		if rem := maxArchiveTotal - total; rem < memberCap {
+			memberCap = rem
 		}
+		if hdr.Size >= 0 && hdr.Size < memberCap {
+			memberCap = hdr.Size
+		}
+		data, err := readAllCapped(tr, memberCap, fmt.Sprintf("archive member %q", hdr.Name))
+		if err != nil {
+			return nil, err
+		}
+		total += int64(len(data))
 		name := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
 		mem.files[name] = data
 		// Index blobs/<alg>/<hex>.

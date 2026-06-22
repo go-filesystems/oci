@@ -74,10 +74,10 @@ func (o *ociLayout) topDescriptor() (descriptor, error) {
 func (t *tarball) topDescriptor() (descriptor, error) {
 	// Prefer an OCI archive index.json.
 	if rc, err := t.fsys.Open("index.json"); err == nil {
-		data, rerr := io.ReadAll(rc)
+		data, rerr := readAllCapped(rc, maxArchiveMember, "archive index.json")
 		rc.Close()
 		if rerr != nil {
-			return descriptor{}, fmt.Errorf("oci: reading archive index.json: %w", rerr)
+			return descriptor{}, rerr
 		}
 		if _, perr := readIndexJSON(data); perr != nil {
 			return descriptor{}, perr
@@ -95,10 +95,10 @@ func (t *tarball) topDescriptor() (descriptor, error) {
 	if err != nil {
 		return descriptor{}, fmt.Errorf("oci: archive has neither index.json nor manifest.json")
 	}
-	data, err := io.ReadAll(rc)
+	data, err := readAllCapped(rc, maxArchiveMember, "manifest.json")
 	rc.Close()
 	if err != nil {
-		return descriptor{}, fmt.Errorf("oci: reading manifest.json: %w", err)
+		return descriptor{}, err
 	}
 	var saves []dockerSaveManifest
 	if err := json.Unmarshal(data, &saves); err != nil {

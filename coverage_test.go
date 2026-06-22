@@ -350,7 +350,7 @@ func TestTreeInternals(t *testing.T) {
 	_, _ = tw.Write([]byte("k"))
 	_ = tw.Close()
 	ov2 := newOverlay()
-	if err := ov2.applyLayer(tar.NewReader(&buf)); err != nil {
+	if err := ov2.applyLayer(tar.NewReader(&buf), maxLayerUncompressed); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := ov2.lookup("/keep"); !ok {

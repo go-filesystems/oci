@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -974,9 +975,19 @@ func TestParseDigestErrors(t *testing.T) {
 }
 
 func TestVerifyDigestNonSHA256(t *testing.T) {
-	// non-sha256 algorithm is accepted without verification.
-	if err := verifyDigest("sha512:"+hex.EncodeToString(make([]byte, 64)), []byte("anything")); err != nil {
-		t.Fatalf("sha512 should pass-through: %v", err)
+	// sha512 is now fully verified: a correct sha512 digest passes...
+	data := []byte("anything")
+	sum := sha512.Sum512(data)
+	if err := verifyDigest("sha512:"+hex.EncodeToString(sum[:]), data); err != nil {
+		t.Fatalf("correct sha512 should verify: %v", err)
+	}
+	// ...and a wrong sha512 digest is rejected (no longer trusted blindly).
+	if err := verifyDigest("sha512:"+hex.EncodeToString(make([]byte, 64)), data); err == nil {
+		t.Fatal("wrong sha512 digest should fail")
+	}
+	// An unknown algorithm is rejected (fail closed), not trusted.
+	if err := verifyDigest("md5:"+hex.EncodeToString(make([]byte, 16)), data); err == nil {
+		t.Fatal("unknown digest algorithm should be rejected")
 	}
 	if err := verifyDigest("bad", nil); err == nil {
 		t.Fatal("bad digest should error")

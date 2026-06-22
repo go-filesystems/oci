@@ -7,6 +7,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+
+	"github.com/go-volumes/safeio"
 )
 
 // FileType constants returned by DirEntry.FileType() and node.ftype. The
@@ -161,10 +163,13 @@ func (o *overlay) lookup(p string) (*node, bool) {
 }
 
 // applyLayer folds one decompressed tar stream onto the merged tree using
-// overlayfs whiteout semantics.
-func (o *overlay) applyLayer(tr *tar.Reader) error {
+// overlayfs whiteout semantics. maxUncompressed bounds the cumulative
+// uncompressed bytes of regular-file contents in this layer; exceeding it (a
+// decompression bomb) fails closed with safeio.ErrTooLarge.
+func (o *overlay) applyLayer(tr *tar.Reader, maxUncompressed int64) error {
 	// Track directories that received an opaque marker in this layer so that
 	// later entries in the same layer are preserved.
+	var consumed int64 // cumulative uncompressed file bytes folded so far
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -217,10 +222,24 @@ func (o *overlay) applyLayer(tr *tar.Reader) error {
 				parent.children[base] = d
 			}
 		case FileTypeRegular:
-			data, err := io.ReadAll(tr)
-			if err != nil {
-				return fmt.Errorf("oci: reading file %q: %w", name, err)
+			// Per-file cap: the smaller of the declared header Size, the
+			// remaining cumulative uncompressed budget, and the absolute
+			// per-file ceiling. hdr.Size is attacker-controlled (and can lie),
+			// so we never trust it to *grow* the cap — only to shrink it — and
+			// we re-check the actual byte count after reading.
+			remaining := maxUncompressed - consumed
+			fileCap := maxFileSize
+			if remaining < fileCap {
+				fileCap = remaining
 			}
+			if hdr.Size >= 0 && hdr.Size < fileCap {
+				fileCap = hdr.Size
+			}
+			data, err := readAllCapped(tr, fileCap, fmt.Sprintf("file %q", name))
+			if err != nil {
+				return err
+			}
+			consumed += int64(len(data))
 			parent.children[base] = &node{
 				name:   base,
 				ftype:  FileTypeRegular,
@@ -278,15 +297,30 @@ func (o *overlay) clearOpaqueFlags() {
 }
 
 // resolveHardlink follows a hardlink node to the regular file it targets.
+// Mutually-referential or self-referential TypeLink entries (A→B→A) would
+// otherwise recurse without bound and panic the host; a VisitSet keyed by
+// inode bails out with safeio.ErrCycle, and a LoopGuard bounds the chain
+// length as a belt-and-braces depth limit.
 func (o *overlay) resolveHardlink(n *node) (*node, error) {
-	target, ok := o.lookup(n.linkname)
-	if !ok {
-		return nil, fmt.Errorf("oci: hardlink %s targets missing path %s", n.name, n.linkname)
+	var seen safeio.VisitSet
+	guard := safeio.NewLoopGuard(maxHardlinkDepth)
+	cur := n
+	for {
+		if err := guard.Next(); err != nil {
+			return nil, fmt.Errorf("oci: hardlink %s: %w", n.name, err)
+		}
+		if err := seen.Check(cur.inode); err != nil {
+			return nil, fmt.Errorf("oci: hardlink %s: %w", n.name, err)
+		}
+		target, ok := o.lookup(cur.linkname)
+		if !ok {
+			return nil, fmt.Errorf("oci: hardlink %s targets missing path %s", cur.name, cur.linkname)
+		}
+		if target.ftype != FileTypeHardlink {
+			return target, nil
+		}
+		cur = target
 	}
-	if target.ftype == FileTypeHardlink {
-		return o.resolveHardlink(target)
-	}
-	return target, nil
 }
 
 // sortedChildren returns a directory's children sorted by name.

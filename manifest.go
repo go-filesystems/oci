@@ -3,7 +3,6 @@ package oci
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 )
 
 // descriptor mirrors an OCI content descriptor (subset we use).
@@ -86,10 +85,14 @@ func resolveManifest(src BlobSource, top descriptor, sel Selector) (*manifest, e
 	if err != nil {
 		return nil, err
 	}
-	data, err := io.ReadAll(rc)
+	limit := maxBlobSize
+	if top.Size > 0 && top.Size < limit {
+		limit = top.Size
+	}
+	data, err := readAllCapped(rc, limit, top.Digest)
 	rc.Close()
 	if err != nil {
-		return nil, fmt.Errorf("oci: reading %s: %w", top.Digest, err)
+		return nil, err
 	}
 	if err := verifyDigest(top.Digest, data); err != nil {
 		return nil, err

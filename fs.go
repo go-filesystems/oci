@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 
@@ -85,11 +84,18 @@ func applyLayerBlob(ov *overlay, src BlobSource, layer descriptor) error {
 	}
 	defer rc.Close()
 
-	// Digest verification requires the full blob; read it once. (Layers can
-	// be large, but we already buffer file contents anyway.)
-	data, err := io.ReadAll(rc)
+	// Digest verification requires the full blob; read it once. Cap the read
+	// at the digest-verified descriptor Size (clamped to the hardening
+	// ceiling) so a blob that streams more bytes than promised — or an
+	// untrusted source with no Size at all — cannot OOM the host. We read up
+	// to limit+1 and reject when the source overruns the declared length.
+	limit := maxBlobSize
+	if layer.Size > 0 && layer.Size < limit {
+		limit = layer.Size
+	}
+	data, err := readAllCapped(rc, limit, "layer "+layer.Digest)
 	if err != nil {
-		return fmt.Errorf("oci: reading layer %s: %w", layer.Digest, err)
+		return err
 	}
 	if err := verifyDigest(layer.Digest, data); err != nil {
 		return err
@@ -102,7 +108,13 @@ func applyLayerBlob(ov *overlay, src BlobSource, layer descriptor) error {
 	if err != nil {
 		return fmt.Errorf("oci: decompressing layer %s: %w", layer.Digest, err)
 	}
-	return ov.applyLayer(tar.NewReader(dr))
+	// Bound the *uncompressed* stream: a tiny gzip blob can expand without
+	// limit (decompression bomb). applyLayer reads every file body through a
+	// bounded readAllCapped and tracks a cumulative budget, so the expansion
+	// is cut off with a graceful safeio.ErrTooLarge rather than buffering the
+	// whole bomb. Tar headers are fixed-size (512 B) so the header reads are
+	// inherently bounded; no outer LimitReader is needed.
+	return ov.applyLayer(tar.NewReader(dr), maxLayerUncompressed)
 }
 
 // resolve resolves a cleaned path to its node, following hardlinks for the
