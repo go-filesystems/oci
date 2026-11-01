@@ -46,6 +46,18 @@ func parseDigest(digest string) (alg, hexpart string, err error) {
 		return "", "", fmt.Errorf("oci: malformed digest %q", digest)
 	}
 	alg, hexpart = digest[:i], digest[i+1:]
+	// The algorithm names a directory in the OCI layout (blobs/<alg>/<hex>), and
+	// it comes from an untrusted manifest: restrict it to the image-spec
+	// grammar (lower-case alphanumerics joined by + . _ -) so "../.." cannot
+	// walk out of the layout.
+	for _, c := range []byte(alg) {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '.' || c == '_' || c == '-') {
+			return "", "", fmt.Errorf("oci: malformed digest %q: bad algorithm", digest)
+		}
+	}
+	if alg == "." || alg == ".." {
+		return "", "", fmt.Errorf("oci: malformed digest %q: bad algorithm", digest)
+	}
 	if _, err := hex.DecodeString(hexpart); err != nil {
 		return "", "", fmt.Errorf("oci: malformed digest %q: %w", digest, err)
 	}
@@ -126,12 +138,19 @@ type tarball struct {
 // Tarball returns a BlobSource backed by a `docker save` / OCI archive tar
 // file on disk.
 func Tarball(p string) (BlobSource, error) {
+	return TarballLimits(p, Limits{})
+}
+
+// TarballLimits is Tarball with an explicit resource budget for the archive
+// (MaxArchiveMember, MaxArchiveTotal, MaxEntries, MaxMetadata, MaxPathLen,
+// MaxSparseHoles). A zero field takes the default.
+func TarballLimits(p string, lim Limits) (BlobSource, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return tarballFromReader(f)
+	return tarballFromReaderLimits(f, lim)
 }
 
 // TarballFS returns a BlobSource backed by an archive tar exposed through an
@@ -166,10 +185,22 @@ func TarballFS(fsys fs.FS) (BlobSource, error) {
 // under blobs/<alg>/<hex> are indexed by that path; bare "<hex>/layer.tar"
 // style members are indexed by their sha256 so manifest references resolve.
 func tarballFromReader(r io.Reader) (BlobSource, error) {
+	return tarballFromReaderLimits(r, Limits{})
+}
+
+func tarballFromReaderLimits(r io.Reader, lim Limits) (BlobSource, error) {
+	lim = lim.resolve()
 	mem := &memFS{files: map[string][]byte{}}
-	tr := tar.NewReader(r)
+	// The stream is read through a counter: the archive may be handed to us
+	// through an fs.FS that decompresses, and an entry of an unknown typeflag is
+	// skipped by reading its body. Members hold at most lim.MaxArchiveTotal
+	// bytes; names and headers get lim.MaxMetadata on top.
+	cr := &countingReader{r: r, max: lim.MaxArchiveTotal + lim.MaxMetadata}
+	tr := tar.NewReader(cr)
 	blobs := map[string]string{}
-	var total int64 // cumulative bytes buffered across all members
+	var total int64   // cumulative bytes buffered across all members
+	var meta int64    // cumulative bytes of stored member names
+	var members int64 // stored members
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -181,18 +212,25 @@ func tarballFromReader(r io.Reader) (BlobSource, error) {
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			continue
 		}
+		// Count and name bytes: a member of zero bytes still costs a map entry
+		// and its name, and a name may be up to 1 MiB in a PAX header.
+		members++
+		meta += int64(len(hdr.Name))
+		if members > lim.MaxEntries || meta > lim.MaxMetadata || len(hdr.Name) > lim.MaxPathLen {
+			return nil, tooLarge("archive holds too many members or names (%d members, %d name bytes)", members, meta)
+		}
 		// Per-member and cumulative caps: an archive must not be able to
 		// buffer a decompression/expansion bomb. The smaller of the absolute
 		// per-member ceiling and the remaining total budget bounds this read;
-		// hdr.Size is attacker-controlled so it only ever shrinks the cap.
-		memberCap := maxArchiveMember
-		if rem := maxArchiveTotal - total; rem < memberCap {
-			memberCap = rem
-		}
+		// hdr.Size is attacker-controlled so it only ever shrinks the cap. A
+		// sparse member reads back as zeros it does not carry: holeGuard bounds
+		// the logical bytes by the physical position plus lim.MaxSparseHoles.
+		memberCap := min(lim.MaxArchiveMember, lim.MaxArchiveTotal-total)
 		if hdr.Size >= 0 && hdr.Size < memberCap {
 			memberCap = hdr.Size
 		}
-		data, err := readAllCapped(tr, memberCap, fmt.Sprintf("archive member %q", hdr.Name))
+		body := &holeGuard{r: tr, phys: cr, base: total, max: lim.MaxSparseHoles}
+		data, err := readAllCapped(body, memberCap, fmt.Sprintf("archive member %q", hdr.Name))
 		if err != nil {
 			return nil, err
 		}

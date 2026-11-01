@@ -1,7 +1,6 @@
 package oci
 
 import (
-	"archive/tar"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -44,15 +43,33 @@ func Open(src BlobSource) (*FS, error) {
 // OpenSelect is like Open but selects a manifest from a multi-arch index by
 // digest or platform.
 func OpenSelect(src BlobSource, sel Selector) (*FS, error) {
-	top, err := topDescriptor(src)
+	return OpenSelectLimits(src, sel, Limits{})
+}
+
+// OpenSelectLimits is OpenSelect with an explicit resource budget for the
+// image: use it to open an untrusted image with tighter ceilings than the
+// defaults. A zero field of lim takes the default (see DefaultLimits). A limit
+// that is exceeded fails with an error wrapping safeio.ErrTooLarge before the
+// memory is spent.
+func OpenSelectLimits(src BlobSource, sel Selector, lim Limits) (*FS, error) {
+	lim = lim.resolve()
+	top, err := topDescriptor(src, lim)
 	if err != nil {
 		return nil, err
 	}
-	m, err := resolveManifest(src, top, sel)
+	m, err := resolveManifestLimits(src, top, sel, lim, 0)
 	if err != nil {
 		return nil, err
 	}
-	ov := newOverlay()
+	return buildFS(src, m, lim)
+}
+
+// buildFS folds every layer of m, in order, onto a fresh tree bounded by lim.
+func buildFS(src BlobSource, m *manifest, lim Limits) (*FS, error) {
+	if len(m.Layers) > lim.MaxLayers {
+		return nil, tooLarge("image has %d layers, more than %d", len(m.Layers), lim.MaxLayers)
+	}
+	ov := newOverlayLimits(lim)
 	for _, layer := range m.Layers {
 		if err := applyLayerBlob(ov, src, layer); err != nil {
 			return nil, err
@@ -89,7 +106,7 @@ func applyLayerBlob(ov *overlay, src BlobSource, layer descriptor) error {
 	// ceiling) so a blob that streams more bytes than promised — or an
 	// untrusted source with no Size at all — cannot OOM the host. We read up
 	// to limit+1 and reject when the source overruns the declared length.
-	limit := maxBlobSize
+	limit := ov.lim.MaxBlob
 	if layer.Size > 0 && layer.Size < limit {
 		limit = layer.Size
 	}
@@ -112,9 +129,11 @@ func applyLayerBlob(ov *overlay, src BlobSource, layer descriptor) error {
 	// limit (decompression bomb). applyLayer reads every file body through a
 	// bounded readAllCapped and tracks a cumulative budget, so the expansion
 	// is cut off with a graceful safeio.ErrTooLarge rather than buffering the
-	// whole bomb. Tar headers are fixed-size (512 B) so the header reads are
-	// inherently bounded; no outer LimitReader is needed.
-	return ov.applyLayer(tar.NewReader(dr), maxLayerUncompressed)
+	// whole bomb. A header is 512 B but the NUMBER of headers, the length of
+	// their names and the data of entries we skip are input-sized too, so
+	// applyLayer also bounds the node count, the name bytes and the whole
+	// decompressed stream.
+	return ov.applyLayer(dr, ov.lim.MaxLayerUncompressed)
 }
 
 // resolve resolves a cleaned path to its node, following hardlinks for the

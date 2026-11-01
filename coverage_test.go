@@ -233,7 +233,7 @@ func (f idxErrFS) Open(name string) (fs.File, error) {
 
 func TestTopDescriptorArchiveIndexReadError(t *testing.T) {
 	tb := &tarball{fsys: idxErrFS{memFS: &memFS{files: map[string][]byte{"index.json": nil}}}, blobs: map[string]string{}}
-	if _, err := tb.topDescriptor(); err == nil {
+	if _, err := tb.topDescriptor(DefaultLimits()); err == nil {
 		t.Fatal("expected index read error")
 	}
 }
@@ -293,7 +293,7 @@ func (f manErrFS) Open(name string) (fs.File, error) {
 
 func TestTopDescriptorDockerManifestReadError(t *testing.T) {
 	tb := &tarball{fsys: manErrFS{memFS: &memFS{files: map[string][]byte{"manifest.json": nil}}}, blobs: map[string]string{}}
-	if _, err := tb.topDescriptor(); err == nil || !bytes.Contains([]byte(err.Error()), []byte("reading manifest.json")) {
+	if _, err := tb.topDescriptor(DefaultLimits()); err == nil || !bytes.Contains([]byte(err.Error()), []byte("reading manifest.json")) {
 		t.Fatalf("want manifest read error, got %v", err)
 	}
 }
@@ -350,7 +350,7 @@ func TestTreeInternals(t *testing.T) {
 	_, _ = tw.Write([]byte("k"))
 	_ = tw.Close()
 	ov2 := newOverlay()
-	if err := ov2.applyLayer(tar.NewReader(&buf), maxLayerUncompressed); err != nil {
+	if err := ov2.applyLayer(&buf, maxLayerUncompressed); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := ov2.lookup("/keep"); !ok {

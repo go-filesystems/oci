@@ -81,11 +81,24 @@ func isManifestMediaType(mt string) bool {
 // resolveManifest walks an index/manifest blob tree starting at the top-level
 // descriptor and returns the concrete image manifest selected by sel.
 func resolveManifest(src BlobSource, top descriptor, sel Selector) (*manifest, error) {
+	return resolveManifestLimits(src, top, sel, Limits{}.resolve(), 0)
+}
+
+// resolveManifestLimits is resolveManifest bounded by lim: a manifest or index
+// is read up to lim.MaxManifest (the OCI distribution spec asks for at least
+// 4 MB), and index-of-index nesting stops at lim.MaxIndexDepth (depth counts
+// the levels already descended). Digest verification makes a cycle impossible,
+// but a long chain of tiny indexes is only bounded by the archive's size, and
+// the recursion would otherwise run to a stack overflow, which Go cannot recover.
+func resolveManifestLimits(src BlobSource, top descriptor, sel Selector, lim Limits, depth int) (*manifest, error) {
+	if depth > lim.MaxIndexDepth {
+		return nil, tooLarge("index nesting deeper than %d", lim.MaxIndexDepth)
+	}
 	rc, err := src.Blob(top.Digest)
 	if err != nil {
 		return nil, err
 	}
-	limit := maxBlobSize
+	limit := lim.MaxManifest
 	if top.Size > 0 && top.Size < limit {
 		limit = top.Size
 	}
@@ -131,7 +144,7 @@ func resolveManifest(src BlobSource, top descriptor, sel Selector) (*manifest, e
 		for _, d := range idx.Manifests {
 			if isIndexMediaType(d.MediaType) || isManifestMediaType(d.MediaType) || d.MediaType == "" {
 				if sel.matches(d) {
-					return resolveManifest(src, d, sel)
+					return resolveManifestLimits(src, d, sel, lim, depth+1)
 				}
 			}
 		}

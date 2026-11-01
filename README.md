@@ -64,6 +64,40 @@ oci.RegisterDecompressor(oci.MediaTypeLayerTarZstd, func(r io.Reader) (io.Reader
 })
 ```
 
+## Untrusted input
+
+An image is untrusted input: a few hundred bytes of gzip can declare a layer that
+expands to gigabytes, and a tar header costs far more memory than its 512 bytes.
+Every input-driven allocation is bounded **before** it happens, and exceeding a
+bound returns an error wrapping `safeio.ErrTooLarge`. Defaults (`DefaultLimits()`):
+
+| Bound | Default | Why |
+| --- | --- | --- |
+| manifest, index, `index.json`, `manifest.json` | 16 MiB | the distribution spec asks for at least 4 MB |
+| raw layer blob | 4 GiB | |
+| regular-file bytes: per file / per layer / whole image | 4 GiB / 8 GiB / 16 GiB | decompression bomb |
+| decompressed tar stream of one layer | 16 GiB | headers and skipped entries count |
+| bytes a layer claims beyond what it carries (sparse holes) | 64 MiB | 199 bytes of gzip declared 1 GiB |
+| tree nodes (files, directories, implied directories) | 2 Mi | a node costs about 1.1 KB |
+| names and link targets, whole image | 512 MiB | a 2 KiB layer held a 1 MiB path |
+| one path or link target | 4096 bytes | Linux `PATH_MAX` |
+| layers / index nesting | 1024 / 16 | |
+
+Open an image with tighter ceilings:
+
+```go
+src, err := oci.TarballLimits("image.tar", oci.Limits{MaxArchiveTotal: 1 << 30})
+img, err := oci.OpenSelectLimits(src, oci.Selector{}, oci.Limits{
+    MaxImageUncompressed: 1 << 30,
+    MaxEntries:           200_000,
+})
+```
+
+A zero `Limits` field takes its default. Digests name a directory in an OCI
+layout (`blobs/<alg>/<hex>`), so an algorithm outside the image-spec grammar
+(`../..`) is rejected rather than followed. `FuzzApplyLayer` and `FuzzOpenTarball`
+exercise the layer folder and the archive reader.
+
 ## License
 
 BSD-3-Clause © the go-filesystems/oci authors.

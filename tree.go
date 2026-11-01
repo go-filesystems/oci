@@ -42,9 +42,14 @@ type node struct {
 	// children for directories: base name -> *node.
 	children map[string]*node
 
-	// opaque marks a directory that had an opaque whiteout applied in the
-	// current layer (used only transiently during a single layer apply).
+	// opaque marks a node touched in the current layer (used only transiently
+	// during a single layer apply; reset through overlay.marked).
 	opaque bool
+
+	// opqDone marks a directory whose opaque whiteout was already applied in the
+	// current layer, so a repeated marker is O(1) instead of a rescan of the
+	// directory (a layer of N files and N markers was O(N^2)).
+	opqDone bool
 }
 
 func newDir(name string, mode uint16, inode uint64) *node {
@@ -83,10 +88,19 @@ func tarTypeToFileType(flag byte) uint8 {
 type overlay struct {
 	root   *node
 	nextID uint64
+
+	lim        Limits
+	imageBytes int64   // regular-file bytes buffered across all layers so far
+	metaBytes  int64   // name and link-target bytes seen across all layers so far
+	marked     []*node // nodes carrying a per-layer flag, reset between layers
 }
 
-func newOverlay() *overlay {
-	o := &overlay{nextID: 1}
+func newOverlay() *overlay { return newOverlayLimits(Limits{}) }
+
+// newOverlayLimits returns an empty tree bounded by lim (zero fields take the
+// defaults).
+func newOverlayLimits(lim Limits) *overlay {
+	o := &overlay{nextID: 1, lim: lim.resolve()}
 	o.root = newDir("", 0o755, o.alloc())
 	return o
 }
@@ -95,6 +109,29 @@ func (o *overlay) alloc() uint64 {
 	id := o.nextID
 	o.nextID++
 	return id
+}
+
+// touch flags n as touched in the current layer.
+func (o *overlay) touch(n *node) {
+	if !n.opaque {
+		n.opaque = true
+		o.marked = append(o.marked, n)
+	}
+}
+
+// put stores n under parent, flagged as touched in the current layer.
+func (o *overlay) put(parent, n *node) {
+	o.touch(n)
+	parent.children[n.name] = n
+}
+
+// checkEntries fails closed once the tree has created more nodes than the
+// budget allows. nextID counts every node ever created (the root is #1).
+func (o *overlay) checkEntries() error {
+	if int64(o.nextID-1) > o.lim.MaxEntries {
+		return tooLarge("image holds more than %d entries", o.lim.MaxEntries)
+	}
+	return nil
 }
 
 // cleanPath normalizes p to a rooted, slash-clean absolute path with no
@@ -166,17 +203,33 @@ func (o *overlay) lookup(p string) (*node, bool) {
 // overlayfs whiteout semantics. maxUncompressed bounds the cumulative
 // uncompressed bytes of regular-file contents in this layer; exceeding it (a
 // decompression bomb) fails closed with safeio.ErrTooLarge.
-func (o *overlay) applyLayer(tr *tar.Reader, maxUncompressed int64) error {
-	// Track directories that received an opaque marker in this layer so that
-	// later entries in the same layer are preserved.
+//
+// r is the decompressed tar stream. It is read through a counter that bounds
+// the whole stream (Limits.MaxLayerStream) and gives the physical position the
+// sparse-hole check compares against. Every other input-driven growth is
+// bounded too: the node count, the bytes of names and link targets, the length
+// of one path, and the regular-file bytes over all layers.
+func (o *overlay) applyLayer(r io.Reader, maxUncompressed int64) error {
+	cr := &countingReader{r: r, max: o.lim.MaxLayerStream}
+	tr := tar.NewReader(cr)
 	var consumed int64 // cumulative uncompressed file bytes folded so far
 	for {
+		if err := o.checkEntries(); err != nil {
+			return err
+		}
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("oci: reading layer tar: %w", err)
+		}
+		if len(hdr.Name) > o.lim.MaxPathLen || len(hdr.Linkname) > o.lim.MaxPathLen {
+			return tooLarge("entry path longer than %d bytes", o.lim.MaxPathLen)
+		}
+		o.metaBytes += int64(len(hdr.Name) + len(hdr.Linkname))
+		if o.metaBytes > o.lim.MaxMetadata {
+			return tooLarge("names and link targets exceed %d bytes", o.lim.MaxMetadata)
 		}
 		name := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
 		if name == "." || name == "/" || name == "" {
@@ -189,7 +242,13 @@ func (o *overlay) applyLayer(tr *tar.Reader, maxUncompressed int64) error {
 			parent := o.ensureDir(dir)
 			if base == ".wh..wh..opq" {
 				// Opaque: clear lower contents of this directory, but keep
-				// entries added in this same layer.
+				// entries added in this same layer. A second marker for the
+				// same directory in the same layer has nothing left to clear.
+				if parent.opqDone {
+					continue
+				}
+				parent.opqDone = true
+				o.marked = append(o.marked, parent)
 				keep := map[string]*node{}
 				for n, c := range parent.children {
 					if c.opaque {
@@ -197,7 +256,7 @@ func (o *overlay) applyLayer(tr *tar.Reader, maxUncompressed int64) error {
 					}
 				}
 				parent.children = keep
-				parent.opaque = true
+				o.touch(parent)
 				continue
 			}
 			removed := strings.TrimPrefix(base, ".wh.")
@@ -214,12 +273,11 @@ func (o *overlay) applyLayer(tr *tar.Reader, maxUncompressed int64) error {
 			if ok && existing.ftype == FileTypeDir {
 				// Update mode but keep children (merge).
 				existing.mode = uint16(hdr.Mode) & 0o7777
-				existing.opaque = true
 				existing.name = base
+				o.touch(existing)
 			} else {
 				d := newDir(base, uint16(hdr.Mode)&0o7777, o.alloc())
-				d.opaque = true
-				parent.children[base] = d
+				o.put(parent, d)
 			}
 		case FileTypeRegular:
 			// Per-file cap: the smaller of the declared header Size, the
@@ -227,73 +285,72 @@ func (o *overlay) applyLayer(tr *tar.Reader, maxUncompressed int64) error {
 			// per-file ceiling. hdr.Size is attacker-controlled (and can lie),
 			// so we never trust it to *grow* the cap — only to shrink it — and
 			// we re-check the actual byte count after reading.
-			remaining := maxUncompressed - consumed
-			fileCap := maxFileSize
-			if remaining < fileCap {
-				fileCap = remaining
-			}
+			//
+			// Two more bounds: the cumulative bytes over ALL layers, and the
+			// sparse-hole guard (a sparse member reads back as zeros it does
+			// not carry; holeGuard compares the logical bytes with the
+			// physical stream position).
+			remaining := min(maxUncompressed-consumed, o.lim.MaxImageUncompressed-o.imageBytes)
+			fileCap := min(o.lim.MaxFile, remaining)
 			if hdr.Size >= 0 && hdr.Size < fileCap {
 				fileCap = hdr.Size
 			}
-			data, err := readAllCapped(tr, fileCap, fmt.Sprintf("file %q", name))
+			body := &holeGuard{r: tr, phys: cr, base: consumed, max: o.lim.MaxSparseHoles}
+			data, err := readAllCapped(body, fileCap, fmt.Sprintf("file %q", name))
 			if err != nil {
 				return err
 			}
 			consumed += int64(len(data))
-			parent.children[base] = &node{
-				name:   base,
-				ftype:  FileTypeRegular,
-				mode:   uint16(hdr.Mode) & 0o7777,
-				size:   uint64(len(data)),
-				inode:  o.alloc(),
-				data:   data,
-				opaque: true,
-			}
+			o.imageBytes += int64(len(data))
+			o.put(parent, &node{
+				name:  base,
+				ftype: FileTypeRegular,
+				mode:  uint16(hdr.Mode) & 0o7777,
+				size:  uint64(len(data)),
+				inode: o.alloc(),
+				data:  data,
+			})
 		case FileTypeSymlink:
-			parent.children[base] = &node{
+			o.put(parent, &node{
 				name:     base,
 				ftype:    FileTypeSymlink,
 				mode:     uint16(hdr.Mode) & 0o7777,
 				size:     uint64(len(hdr.Linkname)),
 				inode:    o.alloc(),
 				linkname: hdr.Linkname,
-				opaque:   true,
-			}
+			})
 		case FileTypeHardlink:
 			// Resolve target relative to root; store the cleaned target path.
 			target := cleanPath("/" + path.Clean(strings.TrimPrefix(hdr.Linkname, "./")))
-			parent.children[base] = &node{
+			o.put(parent, &node{
 				name:     base,
 				ftype:    FileTypeHardlink,
 				mode:     uint16(hdr.Mode) & 0o7777,
 				inode:    o.alloc(),
 				linkname: target,
-				opaque:   true,
-			}
+			})
 		case FileTypeChar, FileTypeBlock, FileTypeFifo:
-			parent.children[base] = &node{
-				name:   base,
-				ftype:  ft,
-				mode:   uint16(hdr.Mode) & 0o7777,
-				inode:  o.alloc(),
-				opaque: true,
-			}
+			o.put(parent, &node{
+				name:  base,
+				ftype: ft,
+				mode:  uint16(hdr.Mode) & 0o7777,
+				inode: o.alloc(),
+			})
 		default:
 			// Unknown/unsupported tar entry types are skipped.
 		}
 	}
 }
 
-// clearOpaqueFlags resets transient opaque markers between layers.
+// clearOpaqueFlags resets the transient per-layer markers between layers. It
+// visits only the nodes the layer touched (o.marked), not the whole tree: with
+// a full walk, N layers over a tree of M nodes cost N*M.
 func (o *overlay) clearOpaqueFlags() {
-	var walk func(n *node)
-	walk = func(n *node) {
+	for _, n := range o.marked {
 		n.opaque = false
-		for _, c := range n.children {
-			walk(c)
-		}
+		n.opqDone = false
 	}
-	walk(o.root)
+	o.marked = o.marked[:0]
 }
 
 // resolveHardlink follows a hardlink node to the regular file it targets.
