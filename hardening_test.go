@@ -19,9 +19,12 @@ import (
 func withLimits(t *testing.T, blob, layer, file, member, total int64) {
 	t.Helper()
 	ob, ol, of, om, ot := maxBlobSize, maxLayerUncompressed, maxFileSize, maxArchiveMember, maxArchiveTotal
+	oh := maxSparseHoles
 	maxBlobSize, maxLayerUncompressed, maxFileSize, maxArchiveMember, maxArchiveTotal = blob, layer, file, member, total
+	maxSparseHoles = 1 << 16 // keep a fuzzed sparse member from reading 64 MiB of zeros per run
 	t.Cleanup(func() {
 		maxBlobSize, maxLayerUncompressed, maxFileSize, maxArchiveMember, maxArchiveTotal = ob, ol, of, om, ot
+		maxSparseHoles = oh
 	})
 }
 
@@ -230,7 +233,7 @@ type oversizeSource struct {
 	data []byte
 }
 
-func (s *oversizeSource) topDescriptor() (descriptor, error) { return s.top, nil }
+func (s *oversizeSource) topDescriptor(Limits) (descriptor, error) { return s.top, nil }
 func (s *oversizeSource) Blob(string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(s.data)), nil
 }
@@ -302,11 +305,19 @@ func FuzzApplyLayer(f *testing.F) {
 	}))
 	f.Add([]byte("junk"))
 	f.Add([]byte{})
+	// Sparse member claiming 1 GiB, and an opaque marker after same-layer files.
+	f.Add(sparseTar(f, "s", 1<<30))
+	f.Add(buildTarRaw(f, []tentry{
+		{name: "d/", typeflag: tar.TypeDir},
+		{name: "d/a", typeflag: tar.TypeReg},
+		{name: "d/.wh..wh..opq", typeflag: tar.TypeReg},
+		{name: "d/.wh..wh..opq", typeflag: tar.TypeReg},
+	}))
 
 	f.Fuzz(func(t *testing.T, layer []byte) {
 		withLimits(t, 1<<20, 1<<20, 1<<18, 1<<20, 4<<20)
 		ov := newOverlay()
-		if err := ov.applyLayer(tar.NewReader(io.LimitReader(bytes.NewReader(layer), maxLayerUncompressed+1)), maxLayerUncompressed); err != nil {
+		if err := ov.applyLayer(io.LimitReader(bytes.NewReader(layer), maxLayerUncompressed+1), maxLayerUncompressed); err != nil {
 			return
 		}
 		// Resolve every node, following hardlinks, to exercise cycle guards.

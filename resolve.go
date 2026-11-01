@@ -18,43 +18,44 @@ func byteReader(b []byte) io.Reader { return bytes.NewReader(b) }
 // Both built-in sources implement it; a caller-supplied BlobSource that does
 // not implement it can still be used via OpenDescriptor.
 type topDescriptorProvider interface {
-	topDescriptor() (descriptor, error)
+	topDescriptor(lim Limits) (descriptor, error)
 }
 
 // topDescriptor resolves the top-level descriptor for src. Sources that don't
 // advertise one are rejected with a clear error directing the caller to
 // OpenDescriptor.
-func topDescriptor(src BlobSource) (descriptor, error) {
+func topDescriptor(src BlobSource, lim Limits) (descriptor, error) {
 	p, ok := src.(topDescriptorProvider)
 	if !ok {
 		return descriptor{}, fmt.Errorf("oci: BlobSource %T does not provide a top descriptor; use OpenDescriptor", src)
 	}
-	return p.topDescriptor()
+	return p.topDescriptor(lim)
 }
 
 // OpenDescriptor opens an image given an explicit top-level descriptor,
 // allowing use of a bare BlobSource that does not embed index discovery.
 func OpenDescriptor(src BlobSource, top descriptor, sel Selector) (*FS, error) {
-	m, err := resolveManifest(src, top, sel)
+	lim := Limits{}.resolve()
+	m, err := resolveManifestLimits(src, top, sel, lim, 0)
 	if err != nil {
 		return nil, err
 	}
-	ov := newOverlay()
-	for _, layer := range m.Layers {
-		if err := applyLayerBlob(ov, src, layer); err != nil {
-			return nil, err
-		}
-		ov.clearOpaqueFlags()
-	}
-	return &FS{ov: ov}, nil
+	return buildFS(src, m, lim)
 }
 
 // ----- OCI layout top descriptor -----
 
-func (o *ociLayout) topDescriptor() (descriptor, error) {
-	data, err := os.ReadFile(filepath.Join(o.dir, "index.json"))
+func (o *ociLayout) topDescriptor(lim Limits) (descriptor, error) {
+	// index.json is a manifest-sized document: read it through the same cap as
+	// a manifest. It used to be an unbounded os.ReadFile.
+	f, err := os.Open(filepath.Join(o.dir, "index.json"))
 	if err != nil {
 		return descriptor{}, fmt.Errorf("oci: reading index.json: %w", err)
+	}
+	data, err := readAllCapped(f, lim.MaxManifest, "index.json")
+	f.Close()
+	if err != nil {
+		return descriptor{}, err
 	}
 	if _, err := readIndexJSON(data); err != nil {
 		return descriptor{}, err
@@ -71,10 +72,10 @@ func (o *ociLayout) topDescriptor() (descriptor, error) {
 
 // ----- Tarball top descriptor -----
 
-func (t *tarball) topDescriptor() (descriptor, error) {
+func (t *tarball) topDescriptor(lim Limits) (descriptor, error) {
 	// Prefer an OCI archive index.json.
 	if rc, err := t.fsys.Open("index.json"); err == nil {
-		data, rerr := readAllCapped(rc, maxArchiveMember, "archive index.json")
+		data, rerr := readAllCapped(rc, lim.MaxManifest, "archive index.json")
 		rc.Close()
 		if rerr != nil {
 			return descriptor{}, rerr
@@ -95,7 +96,7 @@ func (t *tarball) topDescriptor() (descriptor, error) {
 	if err != nil {
 		return descriptor{}, fmt.Errorf("oci: archive has neither index.json nor manifest.json")
 	}
-	data, err := readAllCapped(rc, maxArchiveMember, "manifest.json")
+	data, err := readAllCapped(rc, lim.MaxManifest, "manifest.json")
 	rc.Close()
 	if err != nil {
 		return descriptor{}, err
@@ -107,21 +108,35 @@ func (t *tarball) topDescriptor() (descriptor, error) {
 	if len(saves) == 0 {
 		return descriptor{}, fmt.Errorf("oci: manifest.json is empty")
 	}
-	return t.synthManifest(saves[0])
+	return t.synthManifest(saves[0], lim)
 }
 
 // synthManifest builds an OCI manifest blob from a docker-save manifest.json
 // entry (which references config + layer files by archive path), inserts it
 // into the tarball's content store, and returns a descriptor pointing at it.
-func (t *tarball) synthManifest(s dockerSaveManifest) (descriptor, error) {
+func (t *tarball) synthManifest(s dockerSaveManifest, lim Limits) (descriptor, error) {
 	mem := t.fsys.(*memFS) // tarballFromReader always backs t with *memFS
 
+	// The layer list is input-sized (up to lim.MaxManifest bytes of JSON) and
+	// each name used to cost a full SHA-256 of its member and a descriptor in
+	// the synthesized manifest: refuse the count before spending either, and
+	// hash each distinct member once.
+	if len(s.Layers) > lim.MaxLayers {
+		return descriptor{}, tooLarge("manifest.json lists %d layers, more than %d", len(s.Layers), lim.MaxLayers)
+	}
+	sums := map[string]string{}
 	member := func(kind, p string) ([]byte, string, error) {
-		data, ok := mem.files[normalizeArchivePath(p)]
+		name := normalizeArchivePath(p)
+		data, ok := mem.files[name]
 		if !ok {
 			return nil, "", fmt.Errorf("oci: %s %q: member not found in archive", kind, p)
 		}
-		return data, sha256Digest(data), nil
+		sum, ok := sums[name]
+		if !ok {
+			sum = sha256Digest(data)
+			sums[name] = sum
+		}
+		return data, sum, nil
 	}
 
 	cfg, configDigest, err := member("config", s.Config)
