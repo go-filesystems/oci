@@ -208,10 +208,7 @@ func (f *FS) ReadFile(path string) ([]byte, error) {
 	}
 	if n.spooled {
 		buf := make([]byte, n.size)
-		if _, err := f.ov.sp.section(n.spoolOff, int64(n.size)).ReadAt(buf, 0); err != nil && !(errors.Is(err, io.EOF) && len(buf) == 0) {
-			if errors.Is(err, io.EOF) {
-				err = io.ErrUnexpectedEOF
-			}
+		if _, err := io.ReadFull(f.ov.sp.section(n.spoolOff, int64(n.size)), buf); err != nil {
 			return nil, fmt.Errorf("oci: reading spooled %s: %w", cleanPath(path), err)
 		}
 		return buf, nil
