@@ -132,6 +132,9 @@ func TestTarballSpoolErrorsAndReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer src.(*tarball).Close()
+	if _, err := src.Blob("sha256:zz"); err == nil || !strings.Contains(err.Error(), "malformed digest") {
+		t.Fatalf("Blob with a malformed digest: %v", err)
+	}
 	mem := src.(*tarball).fsys.(*memFS)
 	f, err := mem.Open("big/x")
 	if err != nil {
