@@ -11,7 +11,12 @@ import (
 // image must never OOM the host, recurse without bound, or buffer an
 // arbitrarily large decompression bomb. These defaults are deliberately
 // generous for legitimate disk-image-as-filesystem use (gigabyte-scale
-// uncompressed layers are fine) while still being finite.
+// uncompressed layers are fine) while still being finite. The byte caps below
+// bound DISK, not RAM: layer blobs and file bodies above Limits.SpoolThreshold,
+// or past Limits.MaxMemory in total, are spooled to a temporary file (see FS),
+// so the heap holds at most Limits.MaxMemory (256 MiB) of file contents.
+// Metadata (names, nodes) stays on the heap and is bounded by maxMetadata and
+// maxEntries.
 //
 // The values are package variables so the test suite can lower them with small
 // inputs; callers choose their own budget per image through Limits and
@@ -124,6 +129,24 @@ type Limits struct {
 	MaxArchiveMember int64
 	// MaxArchiveTotal bounds all the members of an archive together.
 	MaxArchiveTotal int64
+
+	// SpoolThreshold is the largest file body, layer blob or archive member
+	// (by declared size) kept on the heap; anything bigger is spooled to a
+	// temporary file. Zero takes the default (4 MiB); a negative value spools
+	// every non-empty body.
+	SpoolThreshold int64
+	// MaxMemory bounds the bytes of file bodies (and archive members) held on
+	// the heap in total: once reached, every further body is spooled whatever
+	// its size. Zero takes the default (256 MiB); a negative value spools
+	// every non-empty body. This, not the MaxImage/MaxLayer caps, is what an
+	// image can make the process hold in RAM for file contents; those caps
+	// bound the temporary file on disk.
+	MaxMemory int64
+	// SpoolDir is the directory of the temporary spool files (created 0600,
+	// unlinked at once where the platform allows it, removed by FS.Close
+	// otherwise). Empty means os.TempDir(). Point it at a volume with room for
+	// MaxImageUncompressed bytes when opening images that large.
+	SpoolDir string
 }
 
 // DefaultLimits returns the default budget: generous for real images,
@@ -144,6 +167,8 @@ func DefaultLimits() Limits {
 		MaxIndexDepth:        maxIndexDepth,
 		MaxArchiveMember:     maxArchiveMember,
 		MaxArchiveTotal:      maxArchiveTotal,
+		SpoolThreshold:       defaultSpoolThreshold,
+		MaxMemory:            defaultMaxMemory,
 	}
 }
 
@@ -191,6 +216,12 @@ func (l Limits) resolve() Limits {
 	}
 	if l.MaxArchiveTotal == 0 {
 		l.MaxArchiveTotal = d.MaxArchiveTotal
+	}
+	if l.SpoolThreshold == 0 {
+		l.SpoolThreshold = d.SpoolThreshold
+	}
+	if l.MaxMemory == 0 {
+		l.MaxMemory = d.MaxMemory
 	}
 	return l
 }

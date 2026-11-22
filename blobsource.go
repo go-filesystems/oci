@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -71,22 +72,34 @@ func parseDigest(digest string) (alg, hexpart string, err error) {
 // bypass content verification by labelling a blob with a digest algorithm we
 // do not implement.
 func verifyDigest(digest string, data []byte) error {
-	alg, want, err := parseDigest(digest)
+	h, want, err := newDigestHash(digest)
 	if err != nil {
 		return err
 	}
-	var got string
+	h.Write(data)
+	return checkDigest(digest, h, want)
+}
+
+// newDigestHash returns the hash for digest's algorithm and the expected hex
+// sum, rejecting an unknown algorithm (fail closed).
+func newDigestHash(digest string) (hash.Hash, string, error) {
+	alg, want, err := parseDigest(digest)
+	if err != nil {
+		return nil, "", err
+	}
 	switch alg {
 	case "sha256":
-		sum := sha256.Sum256(data)
-		got = hex.EncodeToString(sum[:])
+		return sha256.New(), want, nil
 	case "sha512":
-		sum := sha512.Sum512(data)
-		got = hex.EncodeToString(sum[:])
-	default:
-		return fmt.Errorf("oci: unsupported digest algorithm %q (only sha256, sha512)", alg)
+		return sha512.New(), want, nil
 	}
-	if got != want {
+	return nil, "", fmt.Errorf("oci: unsupported digest algorithm %q (only sha256, sha512)", alg)
+}
+
+// checkDigest compares the sum accumulated in h with the expected hex sum.
+func checkDigest(digest string, h hash.Hash, want string) error {
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		alg, _, _ := parseDigest(digest)
 		return fmt.Errorf("oci: digest mismatch for %s: computed %s:%s", digest, alg, got)
 	}
 	return nil
@@ -190,7 +203,14 @@ func tarballFromReader(r io.Reader) (BlobSource, error) {
 
 func tarballFromReaderLimits(r io.Reader, lim Limits) (BlobSource, error) {
 	lim = lim.resolve()
-	mem := &memFS{files: map[string][]byte{}}
+	mem := &memFS{files: map[string][]byte{}, ext: map[string]extent{}, sp: newSpool(lim.SpoolDir)}
+	done := false
+	defer func() {
+		if !done {
+			mem.sp.close()
+		}
+	}()
+	budget := &memBudget{threshold: lim.SpoolThreshold, max: lim.MaxMemory}
 	// The stream is read through a counter: the archive may be handed to us
 	// through an fs.FS that decompresses, and an entry of an unknown typeflag is
 	// skipped by reading its body. Members hold at most lim.MaxArchiveTotal
@@ -230,13 +250,32 @@ func tarballFromReaderLimits(r io.Reader, lim Limits) (BlobSource, error) {
 			memberCap = hdr.Size
 		}
 		body := &holeGuard{r: tr, phys: cr, base: total, max: lim.MaxSparseHoles}
-		data, err := readAllCapped(body, memberCap, fmt.Sprintf("archive member %q", hdr.Name))
-		if err != nil {
-			return nil, err
-		}
-		total += int64(len(data))
+		what := fmt.Sprintf("archive member %q", hdr.Name)
 		name := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
-		mem.files[name] = data
+		var sum [sha256.Size]byte
+		var size int64
+		if hdr.Size >= 0 && budget.inMemory(hdr.Size) {
+			data, err := readAllCapped(body, memberCap, what)
+			if err != nil {
+				return nil, err
+			}
+			size = int64(len(data))
+			sum = sha256.Sum256(data)
+			delete(mem.ext, name)
+			mem.files[name] = data
+		} else {
+			h := sha256.New()
+			off, n, err := mem.sp.copyIn(body, memberCap, what, h)
+			if err != nil {
+				mem.sp.close()
+				return nil, err
+			}
+			size = n
+			h.Sum(sum[:0])
+			delete(mem.files, name)
+			mem.ext[name] = extent{off: off, n: n, sum: "sha256:" + hex.EncodeToString(sum[:])}
+		}
+		total += size
 		// Index blobs/<alg>/<hex>.
 		if strings.HasPrefix(name, "blobs/") {
 			rest := strings.TrimPrefix(name, "blobs/")
@@ -248,10 +287,21 @@ func tarballFromReaderLimits(r io.Reader, lim Limits) (BlobSource, error) {
 		}
 		// Index any member by its sha256 so legacy docker-save layer.tar
 		// files (referenced by sha256 in synthesized manifests) resolve.
-		sum := sha256.Sum256(data)
 		blobs["sha256/"+hex.EncodeToString(sum[:])] = name
 	}
+	done = true
 	return &tarball{fsys: mem, blobs: blobs}, nil
+}
+
+// Close releases the spool file that holds the archive members too large for
+// the in-memory budget. A Tarball source that was opened through Tarball or
+// TarballLimits owns it: Close it once every FS built from it is open (an FS
+// copies what it needs), or let OpenTarball do so. It is idempotent.
+func (t *tarball) Close() error {
+	if mem, ok := t.fsys.(*memFS); ok {
+		return mem.sp.close()
+	}
+	return nil
 }
 
 func (t *tarball) Blob(digest string) (io.ReadCloser, error) {
@@ -264,16 +314,37 @@ func (t *tarball) Blob(digest string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("oci: blob %s: %w", digest, fs.ErrNotExist)
 	}
 	// name is guaranteed present in the backing memFS: the blobs index and
-	// mem.files are populated together.
-	return io.NopCloser(byteReader(t.fsys.(*memFS).files[name])), nil
+	// mem.files / mem.ext are populated together.
+	mem := t.fsys.(*memFS)
+	if e, ok := mem.ext[name]; ok {
+		if mem.sp.f == nil {
+			return nil, fmt.Errorf("oci: blob %s: archive source closed", digest)
+		}
+		return io.NopCloser(mem.sp.section(e.off, e.n)), nil
+	}
+	return io.NopCloser(byteReader(mem.files[name])), nil
 }
 
 // memFS is a trivial in-memory fs.FS for the indexed tarball members.
 type memFS struct {
 	files map[string][]byte
+	// ext holds the members spooled to disk (too large for the in-memory
+	// budget): their extent in sp, and the sha256 digest computed while they
+	// were copied.
+	ext map[string]extent
+	sp  *spool
+}
+
+// extent locates one spooled member.
+type extent struct {
+	off, n int64
+	sum    string
 }
 
 func (m *memFS) Open(name string) (fs.File, error) {
+	if e, ok := m.ext[name]; ok && m.sp != nil && m.sp.f != nil {
+		return &memFile{name: name, rd: m.sp.section(e.off, e.n), size: e.n}, nil
+	}
 	data, ok := m.files[name]
 	if !ok {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
@@ -287,7 +358,14 @@ func (m *memFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	}
 	seen := map[string]bool{}
 	var out []fs.DirEntry
+	keys := make([]string, 0, len(m.files)+len(m.ext))
 	for k := range m.files {
+		keys = append(keys, k)
+	}
+	for k := range m.ext {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
 		top := k
 		if i := strings.IndexByte(k, '/'); i >= 0 {
 			top = k[:i]
@@ -321,13 +399,21 @@ type memFile struct {
 	name string
 	data []byte
 	off  int
+	rd   io.Reader // set for a spooled member; data is unused then
+	size int64
 }
 
 func (f *memFile) Stat() (fs.FileInfo, error) {
+	if f.rd != nil {
+		return memFileInfo{name: f.name, size: f.size}, nil
+	}
 	return memFileInfo{name: f.name, size: int64(len(f.data))}, nil
 }
 
 func (f *memFile) Read(p []byte) (int, error) {
+	if f.rd != nil {
+		return f.rd.Read(p)
+	}
 	if f.off >= len(f.data) {
 		return 0, io.EOF
 	}

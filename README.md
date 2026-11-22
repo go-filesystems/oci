@@ -75,7 +75,8 @@ bound returns an error wrapping `safeio.ErrTooLarge`. Defaults (`DefaultLimits()
 | --- | --- | --- |
 | manifest, index, `index.json`, `manifest.json` | 16 MiB | the distribution spec asks for at least 4 MB |
 | raw layer blob | 4 GiB | |
-| regular-file bytes: per file / per layer / whole image | 4 GiB / 8 GiB / 16 GiB | decompression bomb |
+| regular-file bytes: per file / per layer / whole image | 4 GiB / 8 GiB / 16 GiB | decompression bomb; bounds the **disk** spool, not RAM |
+| file bodies and archive members held in RAM: each / in total | 4 MiB / 256 MiB | larger bodies are spooled to a temporary file (`SpoolThreshold`, `MaxMemory`) |
 | decompressed tar stream of one layer | 16 GiB | headers and skipped entries count |
 | bytes a layer claims beyond what it carries (sparse holes) | 64 MiB | 199 bytes of gzip declared 1 GiB |
 | tree nodes (files, directories, implied directories) | 2 Mi | a node costs about 1.1 KB |
@@ -93,7 +94,24 @@ img, err := oci.OpenSelectLimits(src, oci.Selector{}, oci.Limits{
 })
 ```
 
-A zero `Limits` field takes its default. Digests name a directory in an OCI
+A zero `Limits` field takes its default.
+
+### Memory and disk
+
+The heap never holds more than `Limits.MaxMemory` (256 MiB by default) of file
+contents: a file body, a layer blob or a `docker save` member above
+`Limits.SpoolThreshold` (4 MiB), or past `MaxMemory` in total, is spooled to a
+temporary file (mode 0600, in `Limits.SpoolDir` or `os.TempDir()`, unlinked at
+creation where the platform allows it) and read back with `ReadFile` on demand.
+Layer blobs are staged on disk only while their digest is verified. The 16 GiB
+byte caps therefore bound the temporary **disk** an image can use: point
+`SpoolDir` at a volume with room for them, or lower `MaxImageUncompressed`.
+Names and tree nodes stay on the heap (see the `MaxMetadata` and `MaxEntries`
+rows). Call `FS.Close` to release the spool; a source from `Tarball` /
+`TarballLimits` is an `io.Closer` too (`OpenTarball` closes it for you).
+Before v0.5.0 the whole image was buffered in RAM, up to 16 GiB, by default.
+
+Digests name a directory in an OCI
 layout (`blobs/<alg>/<hex>`), so an algorithm outside the image-spec grammar
 (`../..`) is rejected rather than followed. `FuzzApplyLayer` and `FuzzOpenTarball`
 exercise the layer folder and the archive reader.

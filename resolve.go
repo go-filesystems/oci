@@ -125,21 +125,24 @@ func (t *tarball) synthManifest(s dockerSaveManifest, lim Limits) (descriptor, e
 		return descriptor{}, tooLarge("manifest.json lists %d layers, more than %d", len(s.Layers), lim.MaxLayers)
 	}
 	sums := map[string]string{}
-	member := func(kind, p string) ([]byte, string, error) {
+	member := func(kind, p string) (int64, string, error) {
 		name := normalizeArchivePath(p)
+		if e, ok := mem.ext[name]; ok {
+			return e.n, e.sum, nil
+		}
 		data, ok := mem.files[name]
 		if !ok {
-			return nil, "", fmt.Errorf("oci: %s %q: member not found in archive", kind, p)
+			return 0, "", fmt.Errorf("oci: %s %q: member not found in archive", kind, p)
 		}
 		sum, ok := sums[name]
 		if !ok {
 			sum = sha256Digest(data)
 			sums[name] = sum
 		}
-		return data, sum, nil
+		return int64(len(data)), sum, nil
 	}
 
-	cfg, configDigest, err := member("config", s.Config)
+	cfgSize, configDigest, err := member("config", s.Config)
 	if err != nil {
 		return descriptor{}, err
 	}
@@ -149,11 +152,11 @@ func (t *tarball) synthManifest(s dockerSaveManifest, lim Limits) (descriptor, e
 		Config: descriptor{
 			MediaType: MediaTypeDockerImageConfig,
 			Digest:    configDigest,
-			Size:      int64(len(cfg)),
+			Size:      cfgSize,
 		},
 	}
 	for _, l := range s.Layers {
-		data, dgst, err := member("layer", l)
+		size, dgst, err := member("layer", l)
 		if err != nil {
 			return descriptor{}, err
 		}
@@ -161,7 +164,7 @@ func (t *tarball) synthManifest(s dockerSaveManifest, lim Limits) (descriptor, e
 		m.Layers = append(m.Layers, descriptor{
 			MediaType: MediaTypeDockerLayerTar,
 			Digest:    dgst,
-			Size:      int64(len(data)),
+			Size:      size,
 		})
 	}
 	// json.Marshal of a manifest (only strings/ints/slices/maps) cannot fail.

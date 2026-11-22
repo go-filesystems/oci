@@ -39,6 +39,11 @@ type node struct {
 	// instead we buffer file bytes at index time (see ReadFile strategy).
 	data []byte
 
+	// spooled marks a body kept in the overlay's spool file at spoolOff (size
+	// bytes) instead of data.
+	spooled  bool
+	spoolOff int64
+
 	// children for directories: base name -> *node.
 	children map[string]*node
 
@@ -93,6 +98,9 @@ type overlay struct {
 	imageBytes int64   // regular-file bytes buffered across all layers so far
 	metaBytes  int64   // name and link-target bytes seen across all layers so far
 	marked     []*node // nodes carrying a per-layer flag, reset between layers
+
+	mem memBudget // bytes of file bodies held on the heap
+	sp  *spool    // file bodies too large for the heap budget
 }
 
 func newOverlay() *overlay { return newOverlayLimits(Limits{}) }
@@ -100,7 +108,10 @@ func newOverlay() *overlay { return newOverlayLimits(Limits{}) }
 // newOverlayLimits returns an empty tree bounded by lim (zero fields take the
 // defaults).
 func newOverlayLimits(lim Limits) *overlay {
-	o := &overlay{nextID: 1, lim: lim.resolve()}
+	lim = lim.resolve()
+	o := &overlay{nextID: 1, lim: lim,
+		mem: memBudget{threshold: lim.SpoolThreshold, max: lim.MaxMemory},
+		sp:  newSpool(lim.SpoolDir)}
 	o.root = newDir("", 0o755, o.alloc())
 	return o
 }
@@ -296,20 +307,33 @@ func (o *overlay) applyLayer(r io.Reader, maxUncompressed int64) error {
 				fileCap = hdr.Size
 			}
 			body := &holeGuard{r: tr, phys: cr, base: consumed, max: o.lim.MaxSparseHoles}
-			data, err := readAllCapped(body, fileCap, fmt.Sprintf("file %q", name))
-			if err != nil {
-				return err
-			}
-			consumed += int64(len(data))
-			o.imageBytes += int64(len(data))
-			o.put(parent, &node{
+			what := fmt.Sprintf("file %q", name)
+			n := &node{
 				name:  base,
 				ftype: FileTypeRegular,
 				mode:  uint16(hdr.Mode) & 0o7777,
-				size:  uint64(len(data)),
 				inode: o.alloc(),
-				data:  data,
-			})
+			}
+			var size int64
+			if hdr.Size >= 0 && o.mem.inMemory(hdr.Size) {
+				data, err := readAllCapped(body, fileCap, what)
+				if err != nil {
+					return err
+				}
+				n.data = data
+				size = int64(len(data))
+			} else {
+				off, got, err := o.sp.copyIn(body, fileCap, what, nil)
+				if err != nil {
+					return err
+				}
+				n.spooled, n.spoolOff = true, off
+				size = got
+			}
+			consumed += size
+			o.imageBytes += size
+			n.size = uint64(size)
+			o.put(parent, n)
 		case FileTypeSymlink:
 			o.put(parent, &node{
 				name:     base,

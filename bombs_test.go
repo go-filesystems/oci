@@ -136,6 +136,7 @@ func TestLimitsResolve(t *testing.T) {
 		MaxBlob: 1, MaxManifest: 2, MaxLayerUncompressed: 3, MaxImageUncompressed: 4, MaxFile: 5,
 		MaxLayerStream: 6, MaxSparseHoles: 7, MaxMetadata: 8, MaxEntries: 9, MaxPathLen: 10,
 		MaxLayers: 11, MaxIndexDepth: 12, MaxArchiveMember: 13, MaxArchiveTotal: 14,
+		SpoolThreshold: 15, MaxMemory: 16, SpoolDir: "/spool",
 	}
 	if got := all.resolve(); got != all {
 		t.Fatalf("explicit Limits were altered: %+v", got)
