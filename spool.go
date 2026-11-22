@@ -43,13 +43,11 @@ func (s *spool) file() (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("oci: creating spool file: %w", err)
 	}
-	if runtime.GOOS != "windows" {
-		if err := os.Remove(f.Name()); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("oci: unlinking spool file: %w", err)
-		}
-	} else {
-		s.name = f.Name()
+	// Remember the name; where the platform lets us unlink an open file the
+	// name is forgotten at once, and close removes only what is still named.
+	s.name = f.Name()
+	if runtime.GOOS != "windows" && os.Remove(s.name) == nil {
+		s.name = ""
 	}
 	s.f = f
 	return f, nil
@@ -59,9 +57,7 @@ func (s *spool) file() (*os.File, error) {
 // nil) and returns where they landed. A source that streams more than limit
 // bytes fails closed with safeio.ErrTooLarge, like readAllCapped.
 func (s *spool) copyIn(r io.Reader, limit int64, what string, h hash.Hash) (off, n int64, err error) {
-	if limit < 0 {
-		return 0, 0, fmt.Errorf("oci: %s: %w", what, safeio.ErrTooLarge)
-	}
+	// A negative limit reads zero bytes and 0 > limit refuses below.
 	f, err := s.file()
 	if err != nil {
 		return 0, 0, err

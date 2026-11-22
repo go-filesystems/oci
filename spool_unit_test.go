@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"strings"
 	"testing"
 
 	"github.com/go-volumes/safeio"
@@ -48,8 +49,9 @@ func TestSpoolCopyIn(t *testing.T) {
 	if string(got) != "ab" {
 		t.Fatalf("section = %q", got)
 	}
-	if _, _, err := newSpool(t.TempDir()+"/absent").copyIn(bytes.NewReader([]byte("x")), 1, "dir", nil); err == nil {
-		t.Fatal("copyIn succeeded in a missing directory")
+	_, _, err = newSpool(t.TempDir()+"/absent").copyIn(bytes.NewReader([]byte("x")), 1, "dir", nil)
+	if err == nil || !strings.Contains(err.Error(), "creating spool file") {
+		t.Fatalf("copyIn in a missing directory: %v", err)
 	}
 }
 
@@ -85,6 +87,9 @@ func TestStageBlob(t *testing.T) {
 		if _, _, err := stageBlob(bytes.NewReader(data), 4, declared, 1<<10, dir, dg, "blob"); !errors.Is(err, safeio.ErrTooLarge) {
 			t.Fatalf("declared %d: overrun: %v", declared, err)
 		}
+	}
+	if _, _, err := stageBlob(bytes.NewReader(data), 1<<20, 0, 1<<10, dir, "sha256:zz", "blob"); err == nil || !strings.Contains(err.Error(), "malformed digest") {
+		t.Fatalf("malformed digest: %v", err)
 	}
 	if _, _, err := stageBlob(bytes.NewReader(data), 1<<20, 0, 1<<10, dir+"/absent", dg, "blob"); err == nil {
 		t.Fatal("missing spool dir accepted")

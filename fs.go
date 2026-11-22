@@ -235,9 +235,6 @@ func (f *FS) ReadLink(path string) (string, error) {
 
 // Close releases the filesystem. It is idempotent; a second call returns nil.
 func (f *FS) Close() error {
-	if f.closed {
-		return nil
-	}
 	f.closed = true
 	var err error
 	if f.ov != nil {
