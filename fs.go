@@ -3,6 +3,7 @@ package oci
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 
@@ -16,14 +17,18 @@ var ErrReadOnly = errors.New("oci: read-only filesystem")
 // FS is a read-only github.com/go-filesystems/interface Filesystem view over an
 // OCI/Docker image's merged layer tree.
 //
-// ReadFile strategy: file contents are buffered into the in-memory merged tree
-// at Open time (each regular file's bytes are read once while its owning layer
-// is decompressed). This keeps ReadFile a pure in-memory lookup, makes
-// hardlink resolution trivial (both names share the target's buffered bytes),
-// and avoids holding blob file handles open after Open returns. The trade-off
-// is memory proportional to the uncompressed image size; for the
-// disk-image-as-filesystem use cases this driver targets that is acceptable
-// and matches how the sibling drivers buffer their trees.
+// ReadFile strategy: file contents are read once at Open time, while the
+// owning layer is decompressed, and kept in the merged tree. Small bodies
+// (Limits.SpoolThreshold, 4 MiB by default, up to Limits.MaxMemory, 256 MiB by
+// default, in total) stay on the heap; every larger body is spooled to one
+// temporary file (mode 0600, under Limits.SpoolDir or the system temporary
+// directory, unlinked at creation where the platform allows it and removed by
+// Close otherwise). RAM held for file contents is therefore bounded by
+// MaxMemory however large the image's uncompressed size is, while the disk
+// holds at most MaxImageUncompressed bytes. Hardlink names share the target's
+// body. Layer blobs bigger than the threshold are staged on disk the same way
+// while their digest is verified, and removed as soon as the layer is folded.
+// Call Close to release the spool file.
 type FS struct {
 	ov     *overlay
 	closed bool
@@ -72,6 +77,7 @@ func buildFS(src BlobSource, m *manifest, lim Limits) (*FS, error) {
 	ov := newOverlayLimits(lim)
 	for _, layer := range m.Layers {
 		if err := applyLayerBlob(ov, src, layer); err != nil {
+			ov.sp.close()
 			return nil, err
 		}
 		ov.clearOpaqueFlags()
@@ -89,6 +95,11 @@ func OpenTarball(p string) (*FS, error) {
 	src, err := Tarball(p)
 	if err != nil {
 		return nil, err
+	}
+	if c, ok := src.(io.Closer); ok {
+		// The FS copies every file body it keeps; the archive's spool is no
+		// longer needed once it is built.
+		defer c.Close()
 	}
 	return Open(src)
 }
@@ -110,18 +121,16 @@ func applyLayerBlob(ov *overlay, src BlobSource, layer descriptor) error {
 	if layer.Size > 0 && layer.Size < limit {
 		limit = layer.Size
 	}
-	data, err := readAllCapped(rc, limit, "layer "+layer.Digest)
+	blob, cleanup, err := stageBlob(rc, limit, layer.Size, ov.lim.SpoolThreshold, ov.lim.SpoolDir, layer.Digest, "layer "+layer.Digest)
 	if err != nil {
 		return err
 	}
-	if err := verifyDigest(layer.Digest, data); err != nil {
-		return err
-	}
+	defer cleanup()
 	d, err := lookupDecompressor(layer.MediaType)
 	if err != nil {
 		return err
 	}
-	dr, err := d(byteReader(data))
+	dr, err := d(blob)
 	if err != nil {
 		return fmt.Errorf("oci: decompressing layer %s: %w", layer.Digest, err)
 	}
@@ -197,6 +206,16 @@ func (f *FS) ReadFile(path string) ([]byte, error) {
 	if n.ftype != FileTypeRegular {
 		return nil, fmt.Errorf("oci: %s: not a regular file", cleanPath(path))
 	}
+	if n.spooled {
+		buf := make([]byte, n.size)
+		if _, err := f.ov.sp.section(n.spoolOff, int64(n.size)).ReadAt(buf, 0); err != nil && !(errors.Is(err, io.EOF) && len(buf) == 0) {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, fmt.Errorf("oci: reading spooled %s: %w", cleanPath(path), err)
+		}
+		return buf, nil
+	}
 	buf := make([]byte, len(n.data))
 	copy(buf, n.data)
 	return buf, nil
@@ -216,9 +235,16 @@ func (f *FS) ReadLink(path string) (string, error) {
 
 // Close releases the filesystem. It is idempotent; a second call returns nil.
 func (f *FS) Close() error {
+	if f.closed {
+		return nil
+	}
 	f.closed = true
+	var err error
+	if f.ov != nil {
+		err = f.ov.sp.close()
+	}
 	f.ov = nil
-	return nil
+	return err
 }
 
 // ---- mutating methods: all read-only ----
